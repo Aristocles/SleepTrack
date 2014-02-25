@@ -1,3 +1,17 @@
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    
+
 SleepTrack
 ==========
 
@@ -6,7 +20,7 @@ Hardware build guide and full documentation can be found at: http://makeitbreaki
 
 
 /*
-Sleep Track v1 - Feb 2014
+Sleep Track v1.2 - Feb 2014
 When first powered the serial displays a menu where you can either how previously recorded data or begin recording new data
 After you enter the time the device will not track movements until the button is pressed for ~2 seconds. The pin13 LED then
 flashes fast for about 10 seconds. After flashing stops and the LED is solid it is calibrating the sensor, during this time
@@ -30,3 +44,10 @@ The current code is fairly stable, however, when I tried to add additional code 
 how the serial.print behaves. I believe this is related to the Arduino running out of memory (SRAM).
 So at this point I need to clean up the code (ie. remove so many global variables, for starters).
 */
+
+
+CHANGELOG:
+
+v1.2
+- Fixed time keeping issues which caused length of times reported on a side to be off
+- Increased code efficiency by removing or changing some global variables and changing. There is still much left to do here
