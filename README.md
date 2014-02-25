@@ -2,6 +2,8 @@ SleepTrack
 ==========
 
 Track your sleeping position
+Hardware build guide and full documentation can be found at: http://makeitbreakitfixit.com/2014/02/09/sleeptrack-sleep-apnea-measuring-machine/
+
 
 /*
 Sleep Track v1 - Feb 2014
