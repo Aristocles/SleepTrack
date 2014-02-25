@@ -1,0 +1,579 @@
+/*
+Sleep Track v1.2 - Feb 2014
+
+For full instructions on how to build the hardware and details about how this works,
+see: http://makeitbreakitfixit.com/2014/02/09/sleeptrack-sleep-apnea-measuring-machine/
+
+This is an Arduino-based project. This code was initially designed to run on the Arduino Pro Mini 3.3v.
+
+When first powered the serial displays a menu where you can either how previously recorded data or begin recording new data
+After you enter the time the device will not track movements until the button is pressed for ~2 seconds. The pin13 LED then
+flashes fast for about 10 seconds. After flashing stops and the LED is solid it is calibrating the sensor, during this time
+be sure you are lying on your back. Once the LED turns off calibration is complete and recording has begun.
+The LED will momentarily blink if a change of direction is detected. The direction change is only detected if user moves to
+another direction and stays there for at least 3 seconds (to prevent false positives).
+
+TO DO:
+1) Clean up code and create libraries/classes for much of the code to simplify the main code.
+
+2) At the moment the RTC is too bulky to incorporate in to the main design, so the time must be entered manually each time the
+device is powered. Future plans to create a docking cradle which will output a constant stream of the current time. So when
+the device is plugged in it will automatically sync to the current time.
+
+3) At the moment the device only stores one night of information. This means after every night the device must be connected to
+the computer download previous nights recording and clear the memory. Future plans to store multiple days worth of data and
+possibly have this data transferred across to the docking station, to then be stored in an SD card.
+
+NOTE:
+The current code is fairly stable, however, when I tried to add additional code I saw unexpected behaviour with
+how the serial.print behaves. I believe this is related to the Arduino running out of memory (SRAM).
+So at this point I need to clean up the code (ie. remove so many global variables, for starters).
+*/
+
+
+#include <AcceleroMMA7361.h>
+#include <ReadWrite.h>
+#include <EEPROM.h>
+#include <Time.h>
+#include "Wire.h"
+
+#define DS1307_ADDRESS 0x68
+#define BUTTON 9 // Pin 9 used for the button
+
+byte zero = 0x00; //workaround for issue #527
+AcceleroMMA7361 accelero;
+int prevLay = 9; // Stores previous lay position (9 is NULL/no position)
+int changeLay; // Temp storage of new sensor position
+int currLay; // Current advertised direction of sensor
+unsigned long timer;
+unsigned int checkTime = 3000; // ms to wait until we can declare a new direction
+int writePos = -4;
+int debugMode = 3; // Debug levels 0 (off), 1, 2, 3 and 4 (highest)
+// Last digit in debug parameter list always the debug level that debug line will only show at
+int intTime[2]; // Array of 2 ints. 1st int is hour; 2nd in is minute.
+
+void setup()
+{
+  digitalWrite(13, HIGH); // Turn on LED to indicate we are waiting for data
+  Wire.begin();
+  Serial.begin(9600);
+  // Main Menu
+  Serial.begin(9600);     // opens serial port, sets data rate to 9600 bps
+  Serial.println("Welcome to SleepTrack v2.0");
+  Serial.println("------- Main Menu -------");
+  Serial.println("You have two options:");
+  Serial.println("- Type \"1\" and press enter to show recorded data.");
+  Serial.println("- Enter time in following format \"23:12\" or \"03:09\"");
+  Serial.println();
+  Serial.println("Once the correct time is entered all previously recorded");
+  Serial.println("data will be erased and the device will begin recording");
+  mainMenu(intTime);
+  // At this point we have the current time, but are waiting
+  // for the START button to be pressed.
+  pinMode(BUTTON, INPUT);
+  digitalWrite(BUTTON, HIGH); // Turns internal pull-up resistor on
+  Serial.print("\nWaiting for button to be pressed for 2 seconds before calibrating...");
+  buttonPress();
+  //
+  accelero.begin(3, 4, 5, 2, A3, A5, A4);
+  accelero.setARefVoltage(5); //sets the AREF voltage to 3.3V
+  accelero.setSensitivity(LOW); //sets the sensitivity to +/-6G
+  accelero.calibrate();
+  digitalWrite(13, LOW); // Turn off LED to indicate we are running
+}
+
+void loop() {
+  delay(500);
+  accelero.wake();
+  digitalWrite(13, LOW);
+  int x = accelero.getXAccel();
+  int y = accelero.getYAccel();
+  int z = accelero.getZAccel();
+  accelero.sleep(); // Put sensor to sleep to conserve power
+  debug("Accelerometer coordinates:", 2); debug("x", x, 2); debug("y", y, 2); debug("z", z, "\n", 2);
+  int lay = getLay(x, y, z);
+  debugPrintLay(lay, 1);
+  if (detectChange(lay) == true) {
+    printTime(hour());
+    Serial.print(":");
+    printTime(minute());
+    Serial.print(":");
+    printTime(second());
+    Serial.print(" - ");
+    Serial.print("Position changed: ");
+    debugPrintLay(currLay, 0);
+    saveData(currLay);
+    digitalWrite(13, HIGH);
+  }
+}
+
+// We wait for the button to be pressed for a second or so before
+// the program begins to run. There is a pause before the sensor
+// calibration which allows for the user to lay on his back
+// in preparation for calibration.
+void buttonPress() {
+  boolean buttonLoop = false;
+  int counter = 0;
+  do {
+    delay(100);
+    int buttonState = digitalRead(BUTTON);
+    if (buttonState == HIGH) {
+      debug("\nButton state is HIGH (no button press yet)", 3);
+      counter = 0;
+    }
+    if (buttonState == LOW) {
+      counter++;
+      debug(".", 1);
+      if (counter > 15) { // 15 x 100 (delay) = 1500ms = 1.5 seconds to hold button down
+        debug("\nButton state is LOW (button pressed)", 3);
+        boolean alternate = false;
+        debug("\nFlashing: ", 3);
+        for (int i=0; i < 100; i++) { // Flash LED for 10 secs, then start calibration
+          if (alternate == false) {
+            debug(".", 3);
+            digitalWrite(13, LOW);
+            alternate = true;
+          } else {
+            debug("*", 3);
+            digitalWrite(13, HIGH);
+            alternate = false;
+          }
+          delay(100);
+        }
+        buttonLoop = true; // Exit loop
+      }
+    }
+  } while (buttonLoop == false);
+}
+
+boolean detectChange(int lay) {
+    if (lay == prevLay) {
+    if (getTimerStatus() == true) {
+      if (millis() - timer >= 3000) { // Flowchart path #4
+        debug(lay, 4);
+        currLay = lay;
+        timerState(false);
+        return true;
+      } else { // Flowchart path #5
+        debug(lay, 5);
+        return false;
+      }
+    } else { // Flowchart path #6
+      debug(lay, 6);
+      return false;
+    }
+  } else {
+    if (getTimerStatus() == true) { // Flowchart path #3
+      if (lay == currLay) {
+        debug(lay, 3);
+        prevLay = lay;
+        timerState(false);
+        return false;
+      } else { // Flowchart path #2
+        debug(lay, 2);
+        timerState(true); // Reset timer
+        changeLay = lay;
+        prevLay = lay;
+        return false;
+      }
+    } else { // Flowchart path #1
+      debug(lay, 1);
+      timerState(true);
+      prevLay = lay;
+      changeLay = lay;
+      return false;
+    }
+  }
+}
+
+void printTime(int num) {
+  if (num < 10)
+    Serial.print("0");
+  Serial.print(num);
+}
+
+void readData() {
+  int i = 0;
+  unsigned long prevTime;
+  unsigned long thisTime = 0;
+  boolean looper = true;
+  byte num1 = 1;
+  long timeDiff = 0;
+  int prevLay;
+  
+  while (num1 > 0) { // This is never actually matched, we should exit loop from within the loop
+    prevLay = num1; // Store the lay before it changes. Used in runningTotal()
+    num1 = EEPROM.read(i);
+    byte num2 = EEPROM.read(i+1);
+    byte num3 = EEPROM.read(i+2);
+    byte num4 = EEPROM.read(i+3);
+    
+    if (num1 == 0) // Exit the loop at this point if no more data to process
+      break;
+      
+    // Grab recorded EEPROM data    
+    // Print to serial the recorded data. First the amount of time spent in previous position
+    prevTime = thisTime;
+    thisTime = ((num2 * 60 * 60) + (num3 * 60) + (num4));
+    if (i > 0) { // Prevent an initial "dry run"
+      if (thisTime > prevTime)
+        timeDiff = thisTime - prevTime;
+      if (prevTime > thisTime) // If time clocks over to next day
+        timeDiff = (thisTime - prevTime) + 86400; // Add 24 hours of time to thisTime to compensate
+      Serial.print(" (for: ");
+      convertSecsToTime(timeDiff);
+      Serial.print(")\n");    
+
+      runningTotal(prevLay, timeDiff); // Record total time spent on each position
+    }
+
+    // Then the recorded time in new position
+    printTime(num2);
+    Serial.print(":");
+    printTime(num3);
+    Serial.print(":");
+    printTime(num4);
+    Serial.print(" - ");
+    // Then the position itself
+    Serial.print("Position: ");
+    switch (num1) {
+    case 1:
+       Serial.print("!_BACK_!");
+       break;
+    case 2:
+      Serial.print("<<LEFT__");
+      break;
+    case 3:
+      Serial.print("__RIGHT>>");
+      break;
+    case 4:
+      Serial.print("==PRONE==");
+      break;
+    case 9:
+      Serial.print("********");
+      break;
+    default:
+      Serial.print("\nuhhh, you shouldn't be seeing this\n");
+    }
+    i += 4;
+  }
+  runningTotal(5, 0); // Print the totals
+  Serial.print("\n\nDeleting data...\n");
+  // write a 0 to all 512 bytes of the EEPROM
+  for (int i = 0; i < 512; i++)
+    EEPROM.write(i, 0);
+}
+
+void timerState(boolean action){
+  // True = start timer
+  // False = stop timer
+  if (action == true) {
+    timer = millis();
+    return;
+  }
+  if (action == false) {
+    timer = 0;  
+    return;
+  }
+}
+
+void convertSecsToTime(long seconds) {
+  if (seconds > 3599) { // More than an hour to calculate
+    printTime((seconds / 60) / 60);
+    Serial.print(":");
+    printTime((seconds / 60) % 60);
+    Serial.print(":");
+    printTime(seconds % 60);
+  }
+  if (seconds <= 3599 && seconds > 59) { // More than a minute to calculate
+    Serial.print("00:");
+    printTime((seconds / 60) % 60);
+    Serial.print(":");
+    printTime(seconds % 60);
+  }
+  if (seconds <= 59) { // Only a few seconds to calculate
+    Serial.print("00:00:");
+    printTime(seconds % 60);
+  }
+}
+
+unsigned int lngBackTime;
+unsigned int lngLeftTime;
+unsigned int lngRightTime;
+unsigned int lngProneTime;
+unsigned int lngNullTime;
+int turnedToBack;
+int turnedToLeft;
+int turnedToRight;
+int turnedToProne;
+int turnedToNull;
+int movements;
+
+void runningTotal(int prevLay, int timeDiff) {
+  switch (prevLay) {
+  case 1:
+    movements++;
+    turnedToBack++;
+    lngBackTime += timeDiff;
+    break;
+  case 2:
+    movements++;
+    turnedToLeft++;
+    lngLeftTime += timeDiff;
+    break;
+  case 3:
+    movements++;
+    turnedToRight++;
+    lngRightTime += timeDiff;
+    break;
+  case 4:
+    movements++;
+    turnedToProne++;
+    lngProneTime += timeDiff;
+    break;
+  case 9:
+    movements++;
+    turnedToNull++;
+    lngNullTime += timeDiff;
+    break;
+  default:
+    Serial.print("\n <unknown position> \n");
+  }
+}
+
+void printTotalTimes() {
+/*
+// This section of code commented out because I believe the program is hitting
+// the SRAM limit as I am seeing odd behaviour with the serial output when
+// debugging (missing serial.print data, etc).
+// Until I can decrease the amount of memory used (via reducing global variables and possibly
+// other code enhancements) then I will leave this code out.
+
+    debug("\nTOTAL TIME IN POSITION", 0);
+    debug("\nBack: ", 0);
+    convertSecsToTime(lngBackTime);
+    debug(" turned ", turnedToBack, " times.", 0);
+    convertSecsToTime(lngLeftTime);
+    debug(" turned ", turnedToLeft, " times.", 0);
+    debug("\nRight: ", 0);
+    convertSecsToTime(lngRightTime);
+    debug(" turned ", turnedToRight, " times.", 0);
+    debug("\nProne: ", 0);
+    convertSecsToTime(lngProneTime);
+    debug(" turned ", turnedToProne, " times.", 0);
+    debug("\nNULL: ", 0);
+    convertSecsToTime(lngNullTime);
+    debug(" turned ", turnedToNull, " times.", 0);
+    debug("\nTotal:", 0);
+    convertSecsToTime(lngBackTime + lngLeftTime + lngRightTime + lngProneTime + lngNullTime);
+    debug(" turned ", (turnedToBack + turnedToLeft + turnedToRight + turnedToProne + turnedToNull), " times.", 0);
+*/
+}
+
+boolean getTimerStatus() {
+  if (timer > 0)
+    return true;
+  if (timer <= 0)
+    return false;
+}
+
+int getLay(int x, int y, int z) {
+  // First we translate the sensors raw data in to a 'direction'.
+  // Either lying on back (supine), left, right or on stomach (prone).
+  if ((x >= -130 && x < 130) && (z >= 50)) {
+    return 1; // Supine/Back position
+  }
+  if ((x > 110 && x <= 180) && (z > -100 && z < 90)) {
+    return 2; // Left position
+  }
+  if ((x >= -190 && x < -100) && (z > -100 && z < 90)) {
+    return 3; // Right position
+  }
+  if ((x >= -130 && x <= 130) && (z <= -50)) {
+    return 4; // Prone/Stomach position
+  }        
+  return 9;
+}
+
+/*
+#
+#  Read/Write to EEPROM functions
+#
+*/
+
+void saveData(int lay) {
+  // here we need to get the time and encode it in to the number we save
+  // 4 bytes will be saved in to memory, but only 3 will be populated.
+  // The 4th is for extra info we may come up with later.
+  // The first digit is the lay (always just a single digit)
+  // The 2nd and 3rd digits are the minute in 24 hour format
+  // The 4th and 5th digits are the minute
+  // The 6th and 7th digits are the hrs
+  // Example: 1000000 - This is lay position 1 (back). Time 00:00:00
+  // Example: 4234412 - Lay position 4 (stomach). Time 23:44:12
+  // savedata.writeLong(writePos + 4, timer);
+  writePos += 4;
+  
+  debug("Writing to EEPROM from position", writePos, "\n" , 2);
+  
+  EEPROM.write((writePos), (byte)lay);
+  EEPROM.write((writePos + 1), (byte)hour());
+  EEPROM.write((writePos + 2), (byte)minute());
+  EEPROM.write((writePos + 3), (byte)second());
+
+  for (int i=0; i < 4; i++) {
+    byte num = EEPROM.read(writePos + i);
+    debug("Written to EEPROM. Position", (writePos + i), 2);
+    debug("with data", num, "\n" , 2);
+  }
+}
+
+/*
+#
+#  Debugging functions
+#
+*/
+
+void debugPrintLay(int lay, int intDbgLvl) {
+  // Prints sanitised output of sensor
+  switch (lay) {
+   case 9:
+     debug("NULL\n", intDbgLvl);
+     break;
+   case 1:
+     debug("Lying on back\n", intDbgLvl);
+     break;
+   case 2:
+     debug("Turned to left\n", intDbgLvl);
+     break;
+   case 3:
+     debug("Turned to right\n", intDbgLvl);
+     break;
+   case 4:
+     debug("Turned to stomach\n", intDbgLvl);
+     break;
+   default:
+     debug("UNDEFINED OUTPUT. CHECK CODE\n", intDbgLvl);
+ }  
+}
+
+void debug(int lay, int state) {
+  if (!(debugMode >= 3))
+    return;
+  Serial.print(state); Serial.print(" >>> "); Serial.print("lay: ");
+  Serial.print(lay); Serial.print(" | prevLay: "); Serial.print(prevLay);
+  Serial.print(" | changeLay: "); Serial.print(changeLay); Serial.print(" | currLay: ");
+  Serial.print(currLay); Serial.print(" | Timer: "); Serial.println(timer); 
+}
+
+void debug(String strText, int intDbgLvl) {
+  if (!(debugMode >= intDbgLvl))
+    return;
+  Serial.print(strText);
+  Serial.print(" ");
+}
+
+void debug(String strText, int intNum, int intDbgLvl) {
+  if (!(debugMode >= intDbgLvl))
+    return;
+  Serial.print(strText);
+  Serial.print(": ");
+  Serial.print(intNum);
+  Serial.print(" ");
+}
+
+void debug(String strText, int intNum, String strText2, int intDbgLvl) {
+  if (!(debugMode >= intDbgLvl))
+    return;
+  Serial.print(strText);
+  Serial.print(": ");
+  Serial.print(intNum);
+  Serial.print(strText2);
+}
+
+/*
+#
+# Main menu and serial hour:minute input
+#
+*/
+
+void mainMenu(int lclData[]) {
+  char inData[20];
+  char inChar;
+  int index = 0;
+  boolean startProgram = false;
+  boolean runLoop = true;
+  boolean inputAccepted = false;
+  do {
+    while (startProgram == false) {
+     // Note: Each char is placed inside the serial buffer individually, so there is a chance
+     // that while adding the chars the 'while' statement may trigger even if the total chars
+     // is outside of the range.
+     delay(100); // Need a delay otherwise all happens too quick and things buckle
+     while (Serial.available() > 0 && Serial.available() <= 19) {
+        if (index < 19) {
+          inChar = (char)Serial.read();
+          inData[index] = inChar;
+          index++;
+          inData[index] = '\0';
+        } 
+        runLoop = false;
+      }
+      delay(100); // Need a delay otherwise all happens too quick and things buckle
+      if (runLoop == false && Serial.available() == 0) {
+        startProgram = true;
+      }
+      if (Serial.available() >= 20) {
+        Serial.println("Invalid input detected - try again");
+        while (Serial.available() > 0) {
+          inChar = (char)Serial.read();
+        }
+      }
+    }
+    boolean blReset = checkInput(inData, lclData, &inputAccepted); // Invalid data entered if TRUE returned
+    if (blReset == true) { 
+      startProgram = false;
+      runLoop = true;
+      index = 0;
+    }
+  } while (inputAccepted == false);
+}
+
+boolean checkInput(char inData[], int lclData[], boolean *lclAccepted) {
+  if (inData[0] == '1' && inData[1] == NULL) {
+    // Show contents of EEPROM and then clear EEPROM
+    readData();
+    Serial.print("\nPlease enter current time to begin recording\n");
+//    *lclAccepted = true;
+    return true;
+  } else {
+    String strHour; // We use a string to store both chars inside
+    int intHour; // Once both chars are inside we then convert it to an int
+    String strMinute;
+    int intMinute;
+    if (inData[2] == ':' && inData[5] == NULL) {
+      if ( // Check for valid hour and minute data
+           (((inData[0] == '0' || inData[0] == '1') && (inData[1] >= '0' && inData[1] <= '9')) ||
+           ((inData[0] == '2') && (inData[1] >= '0' && inData[1] <= '3'))) &&
+           ((inData[3] >= '0' && inData[3] <= '5') && (inData[4] >= '0' && inData[4] <= '9'))) {
+        strHour = (String)inData[0]; // Grab first char, cast and place inside String
+        strHour.concat(inData[1]); // Concatenate the second char to the String
+        strMinute = (String)inData[3];
+        strMinute.concat(inData[4]);
+        intHour = strHour.toInt(); // Then cast the whole String to an int
+        intMinute = strMinute.toInt();
+        lclData[0] = intHour;
+        lclData[1] = intMinute;
+        setTime(intHour, intMinute, 0, 1, 1, 2000);
+        *lclAccepted = true;
+        return false;
+      } else {
+        Serial.println("The time you entered looks wrong - try again");
+        return true;
+      }
+    } else {
+      Serial.println("Invalid input. Expecting time or \"1\" - try again");
+      return true;
+    }
+  }
+}
